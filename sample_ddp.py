@@ -1,0 +1,205 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+Samples a large number of images from a pre-trained DiM model using DDP.
+Subsequently saves a .npz file that can be used to compute FID and other
+evaluation metrics via the ADM repo: https://github.com/openai/guided-diffusion/tree/main/evaluations
+
+For a simple single-GPU/CPU sampling script, see sample.py.
+"""
+import torch
+import torch.distributed as dist
+# from diffuseMambaV1 import DiM_models
+from diffuseMamba import DiM_models
+from download import find_model
+from diffusion import create_diffusion
+from diffusers.models import AutoencoderKL
+from tqdm import tqdm
+import os
+from PIL import Image
+import numpy as np
+import math
+import argparse
+from train_mamba import CustomDataset
+from torch.utils.data import Dataset, DataLoader
+from torchvision.utils import save_image
+
+def create_npz_from_sample_folder(sample_dir, num=50_000):
+    """
+    Builds a single .npz file from a folder of .png samples.
+    """
+    samples = []
+    for i in tqdm(range(num), desc="Building .npz file from samples"):
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
+    samples = np.stack(samples)
+    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
+    npz_path = f"{sample_dir}.npz"
+    np.savez(npz_path, arr_0=samples)
+    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    return npz_path
+
+
+def main(args):
+    """
+    Run sampling.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
+    assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
+    torch.set_grad_enabled(False)
+
+    # Setup DDP:
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+
+    if args.ckpt is None:
+        assert args.model == "DiM-XL/2", "Only DiM-XL/2 models are available for auto-download."
+        assert args.image_size in [256, 512]
+        assert args.num_classes == 1000
+
+    # Load model:
+    latent_size = args.image_size // 8
+    model = DiM_models[args.model](
+        # input_size=latent_size,
+        input_size=args.image_size,
+        num_classes=args.num_classes
+    ).to(device)
+    # Auto-download a pre-trained model or load a custom DiM checkpoint from train.py:
+    # ckpt_path = args.ckpt or f"DiM-XL-2-{args.image_size}x{args.image_size}.pt"
+    ckpt_path = args.ckpt
+    checkpoint = find_model(ckpt_path)
+    if "ema" in checkpoint:  # supports checkpoints from train.py
+            state_dict = checkpoint["ema"]
+    model.load_state_dict(state_dict)
+    model.eval()  # important!
+    diffusion = create_diffusion(str(args.num_sampling_steps))
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
+    using_cfg = args.cfg_scale > 1.0
+
+    # Create folder to save samples:
+    model_string_name = args.model.replace("/", "-")
+    ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
+                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
+    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    if rank == 0:
+        os.makedirs(sample_folder_dir, exist_ok=True)
+        print(f"Saving .png samples at {sample_folder_dir}")
+    dist.barrier()
+
+    # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
+    n = args.per_proc_batch_size
+    global_batch_size = n * dist.get_world_size()
+    # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
+    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    if rank == 0:
+        print(f"Total number of images that will be sampled: {total_samples}")
+    assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
+    samples_needed_this_gpu = int(total_samples // dist.get_world_size())
+    assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
+    # iterations = int(samples_needed_this_gpu // n)
+    # pbar = range(iterations)
+    # pbar = tqdm(pbar) if rank == 0 else pbar
+    total = 0
+    features_x_dir = f'dataPath/val'
+    features_y_dir = f'adtaPath/val'
+    dataset = CustomDataset(args.input_data_path.replace('x_adv', 'x_clean'), args.input_data_path)
+    loader = DataLoader(
+        dataset,
+        batch_size=n,
+        shuffle=True,
+        num_workers=1,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    # for _ in pbar:
+    path_folder = args.output_data_path +  model_string_name[-4:] + '_' + os.path.split(args.ckpt)[1][-9:-3] + '_' + str(args.num_sampling_steps)
+    if not os.path.exists(path_folder):
+        os.makedirs(path_folder)
+    for _, y, _, y_path in loader:
+        # Sample inputs:
+        # z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+        # y = torch.randint(0, args.num_classes, (n,), device=device)
+        z = torch.randn(n, 3, args.image_size, args.image_size, device=device)
+        y = y.permute(0, 3, 1, 2).to('cuda')
+        # _, y, _, _ = next(loader)
+        # Setup classifier-free guidance:
+        # using_cfg = False
+        # if using_cfg:
+        #     z = torch.cat([z, z], 0)
+        #     y_null = torch.tensor([1000] * n, device=device)
+        #     y = torch.cat([y, y_null], 0)
+        #     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+        #     sample_fn = model.forward_with_cfg
+        # else:
+        #     # model_kwargs = dict(y=y)
+        sample_fn = model.forward
+
+        # Sample images:
+        z = torch.cat((z, y), dim=1)
+        samples = diffusion.p_sample_loop(
+            sample_fn, z.shape, z, clip_denoised=False, model_kwargs=None, progress=False, device=device
+        )
+        # if using_cfg:
+        #     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+
+        samples = torch.clamp(127.5 * (samples + 1), 0, 255).to("cpu", dtype=torch.uint8).numpy()
+        for i in range(samples.shape[0]):
+            # index = i * dist.get_world_size() + rank + total
+            image = Image.fromarray(np.uint8(samples[i].transpose(1, 2, 0)))
+            save_dir = os.path.split(y_path[i])[1]
+            path = os.path.join(path_folder, save_dir)
+            print(path)
+        print(f'saved {total} images')
+    # Make sure all processes have finished saving their samples before attempting to convert to .npz
+    '''
+    dist.barrier()
+    if rank == 0:
+        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        print("Done.")
+    dist.barrier()
+    dist.destroy_process_group()
+    '''
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # parser.add_argument("--model", type=str, choices=list(DiM_models.keys()), default="DiM-XL/2")
+    parser.add_argument("--model", type=str, choices=list(DiM_models.keys()), default="DiM-XL/16")
+    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--sample-dir", type=str, default="samples")
+    parser.add_argument("--per-proc-batch-size", type=int, default=64)
+    parser.add_argument("--num-fid-samples", type=int, default=10) #default=50_000
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=32)
+    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--cfg-scale",  type=float, default=1.0) #default=1.5
+    parser.add_argument("--num-sampling-steps", type=int, default=500)
+    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--input_data_path", type=str, default='', help='input data for defense, the input data is adversarial examples')
+    parser.add_argument("--output_data_path", type=str, default='', help='path for defensed images save')
+    parser.add_argument("--tf32", action='store_true', default=True,
+                        help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
+    parser.add_argument("--ckpt", type=str, default=f'modelPath/checkpoints/0500000.pt',
+                        help="Optional path to a DiM checkpoint (default: auto-download a pre-trained DiM-XL/2 model).")
+    args = parser.parse_args()
+    main(args)
+
+
+"""
+export HF_HOME="/comp_robot/rentianhe/caohe/cache"
+MODEL_VERSION=007-DiM-S-2
+CKPT=0200000
+torchrun --nnodes=1 --nproc_per_node=4 sample_ddp.py --model DiM-S/2 --num-fid-samples 50000 --ckpt results/$MODEL_VERSION/checkpoints/$CKPT.pt --sample-dir samples/$MODEL_VERSION-$CKPT --per-proc-batch-size 64 --cfg-scale 1.0
+"""
